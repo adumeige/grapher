@@ -9,9 +9,25 @@ import org.antoined.grapher.Type
 
 private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
 
+/**
+ * Serialises this descriptor to an indented JSON Schema string (draft 2020-12).
+ *
+ * Convenience wrapper around [toJsonSchema].
+ */
 fun Descriptor.toJsonSchemaString(): String =
     objectMapper.writeValueAsString(toJsonSchema())
 
+/**
+ * Converts this descriptor to a JSON Schema 2020-12 map.
+ *
+ * Mapping rules:
+ * - [Descriptor] → root `object` with `$schema`, `title`, `description`, and `properties`.
+ * - Fields with `multiplicity.min > 0` are added to `required`.
+ * - [Part] with `multiplicity.max > 1` → `array` wrapping an `object`; otherwise plain `object`.
+ * - [Property] with `multiplicity.max > 1` → `array` wrapping the scalar schema.
+ * - `hints` → `description` (joined with `". "`).
+ * - [org.antoined.grapher.Type.DATE] → `{ "type": "string", "format": "date" }`.
+ */
 fun Descriptor.toJsonSchema(): Map<String, Any> {
     val properties = linkedMapOf<String, Any>()
     val required = mutableListOf<String>()
