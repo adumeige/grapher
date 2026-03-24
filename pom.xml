@@ -12,6 +12,7 @@
     <modules>
         <module>format</module>
         <module>format-io</module>
+        <module>format-dsl</module>
     </modules>
 
     <properties>
