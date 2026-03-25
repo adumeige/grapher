@@ -14,6 +14,7 @@
         <module>format-io</module>
         <module>format-dsl</module>
         <module>grapher-fsm</module>
+        <module>grapher-cli</module>
     </modules>
 
     <properties>
