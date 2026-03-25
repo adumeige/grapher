@@ -13,6 +13,7 @@
         <module>format</module>
         <module>format-io</module>
         <module>format-dsl</module>
+        <module>grapher-fsm</module>
     </modules>
 
     <properties>
