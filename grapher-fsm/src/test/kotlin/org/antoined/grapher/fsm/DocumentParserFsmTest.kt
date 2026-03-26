@@ -28,7 +28,7 @@ private fun fsm(
     locator: PartLocator          = PartLocator { _, _ -> emptyList() },
     extractor: PropertyExtractor  = PropertyExtractor { _, _ -> emptyList() },
     maxDepth: Int                 = Int.MAX_VALUE
-) = DocumentParserFsm(descriptor, source, locator, extractor, maxDepth)
+) = DocumentParserFsm(descriptor, source, locator, extractor, maxDepth = maxDepth)
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

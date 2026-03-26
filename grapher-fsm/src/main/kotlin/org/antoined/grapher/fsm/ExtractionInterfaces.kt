@@ -32,6 +32,21 @@ fun interface PartLocator {
 }
 
 /**
+ * Locates all sibling [Part]s within a parent [Document] scope in a single call.
+ *
+ * This is the preferred interface for LLM-based extraction: the FSM groups all
+ * sibling parts that share the same parent scope and calls [locateAll] once per
+ * group, allowing the implementation to segment the document in one shot rather
+ * than making one call per part.
+ *
+ * Returns a map from each [Part] to its located occurrences. Parts not present
+ * in the result (or mapped to an empty list) are treated as absent.
+ */
+fun interface LevelLocator {
+    fun locateAll(parts: List<Part>, context: Document): Map<Part, List<Located<Document>>>
+}
+
+/**
  * Extracts the value(s) of a [Property] from a [Document] scope.
  *
  * Returns a [List] to accommodate properties with `multiplicity.max > 1`.

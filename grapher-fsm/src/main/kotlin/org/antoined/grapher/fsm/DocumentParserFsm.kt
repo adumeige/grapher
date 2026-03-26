@@ -22,10 +22,11 @@ private data class BfsItem(
  *
  * Extraction proceeds in two distinct passes:
  *
- * **Pass 1 — BFS part location:** [PartLocator] is called for every [Part] in
- * the descriptor tree, level by level (breadth-first), until [maxDepth] is
- * reached. All locate calls at depth N complete before any at depth N+1.
- * The FSM is in state [FsmState.Locating] throughout this pass.
+ * **Pass 1 — BFS part location:** Parts are located level by level
+ * (breadth-first), until [maxDepth] is reached. When a [LevelLocator] is
+ * provided, all sibling parts that share the same parent scope are located
+ * in a single call; otherwise each part is located individually via
+ * [PartLocator]. The FSM is in state [FsmState.Locating] throughout this pass.
  *
  * **Pass 2 — DFS property extraction:** The located scopes from Pass 1 are
  * walked depth-first. [PropertyExtractor] is called at every node to fill in
@@ -36,8 +37,10 @@ private data class BfsItem(
  *
  * @param descriptor        The document structure to traverse.
  * @param source            Provides the root [Document] to extract from.
- * @param partLocator       Locates part occurrences within a document scope.
+ * @param partLocator       Locates individual part occurrences within a document scope.
  * @param propertyExtractor Extracts property values from a document scope.
+ * @param levelLocator      Optional batch locator — when provided, sibling parts sharing
+ *                          the same parent scope are located in a single call.
  * @param maxDepth          Maximum depth for Pass 1. Parts deeper than this
  *                          produce [PartInstances] with empty [PartInstances.occurrences].
  *                          Defaults to [Int.MAX_VALUE] (no limit).
@@ -47,6 +50,7 @@ class DocumentParserFsm(
     private val source: DocumentSource,
     private val partLocator: PartLocator,
     private val propertyExtractor: PropertyExtractor,
+    private val levelLocator: LevelLocator? = null,
     private val maxDepth: Int = Int.MAX_VALUE
 ) {
     private var _state: FsmState = FsmState.Idle
@@ -104,21 +108,52 @@ class DocumentParserFsm(
         }
 
         while (queue.isNotEmpty()) {
-            val (part, parentScope, depth, sink) = queue.removeFirst()
-            _state = FsmState.Locating(descriptor, currentDepth = depth, maxDepth = maxDepth)
+            // Drain all items at the current depth, grouped by (parentScope, sink)
+            val currentDepth = queue.first().depth
+            val currentLevel = mutableListOf<BfsItem>()
+            while (queue.isNotEmpty() && queue.first().depth == currentDepth) {
+                currentLevel.add(queue.removeFirst())
+            }
 
-            val locatedScopes = partLocator.locate(part, parentScope)
+            _state = FsmState.Locating(descriptor, currentDepth = currentDepth, maxDepth = maxDepth)
 
-            val records = locatedScopes.map { (scope, location) ->
-                val childSink = mutableListOf<LocatedInstances>()
-                if (depth < maxDepth) {
-                    part.parts.forEach { childPart ->
-                        queue.addLast(BfsItem(childPart, scope, depth + 1, childSink))
+            if (levelLocator != null) {
+                // Group siblings by parent scope and batch-locate
+                val groups = currentLevel.groupBy { it.parentScope }
+                for ((scope, items) in groups) {
+                    val parts = items.map { it.part }
+                    val located = levelLocator.locateAll(parts, scope)
+
+                    for (item in items) {
+                        val locatedScopes = located[item.part] ?: emptyList()
+                        val records = locatedScopes.map { (childScope, location) ->
+                            val childSink = mutableListOf<LocatedInstances>()
+                            if (currentDepth < maxDepth) {
+                                item.part.parts.forEach { childPart ->
+                                    queue.addLast(BfsItem(childPart, childScope, currentDepth + 1, childSink))
+                                }
+                            }
+                            LocatedRecord(childScope, location, childSink)
+                        }
+                        item.sink.add(LocatedInstances(item.part, records))
                     }
                 }
-                LocatedRecord(scope, location, childSink)
+            } else {
+                // Locate one part at a time (original behavior)
+                for (item in currentLevel) {
+                    val locatedScopes = partLocator.locate(item.part, item.parentScope)
+                    val records = locatedScopes.map { (scope, location) ->
+                        val childSink = mutableListOf<LocatedInstances>()
+                        if (currentDepth < maxDepth) {
+                            item.part.parts.forEach { childPart ->
+                                queue.addLast(BfsItem(childPart, scope, currentDepth + 1, childSink))
+                            }
+                        }
+                        LocatedRecord(scope, location, childSink)
+                    }
+                    item.sink.add(LocatedInstances(item.part, records))
+                }
             }
-            sink.add(LocatedInstances(part, records))
         }
 
         return topLevelSink
