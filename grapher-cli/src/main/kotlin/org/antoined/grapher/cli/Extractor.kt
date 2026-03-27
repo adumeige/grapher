@@ -8,6 +8,7 @@ import org.antoined.grapher.Descriptor
 import org.antoined.grapher.Part
 import org.antoined.grapher.Property
 import org.antoined.grapher.fsm.*
+import org.antoined.grapher.io.toJsonSchemaString
 import java.io.File
 
 /**
@@ -17,6 +18,34 @@ import java.io.File
  * a located part.
  */
 class TextDocument(val text: String) : Document
+
+/**
+ * A [Location] expressed as character and line coordinates within the source text.
+ *
+ * All indices are zero-based. [endChar] is exclusive.
+ */
+data class TextLocation(
+    val startChar: Int,
+    val endChar: Int,
+    val startLine: Int,
+    val endLine: Int,
+) : Location {
+    companion object {
+        /** Find [needle] in [haystack] and return its [TextLocation], or `null` if not found. */
+        fun find(needle: String, haystack: String): TextLocation? {
+            val idx = haystack.indexOf(needle)
+            if (idx < 0) return null
+            val startLine = haystack.substring(0, idx).count { it == '\n' }
+            val endLine = startLine + needle.count { it == '\n' }
+            return TextLocation(
+                startChar = idx,
+                endChar = idx + needle.length,
+                startLine = startLine,
+                endLine = endLine,
+            )
+        }
+    }
+}
 
 /**
  * Bridges Kreuzberg (document-to-text) and a langchain4j chat model (text-to-structured-data)
@@ -44,10 +73,10 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
         log("  LLM #$step [$label] sending ${prompt.length} chars…")
 
         dump(step, label, "prompt") {
-            appendLine("=== SYSTEM ===")
+            appendLine("== SYSTEM ==")
             appendLine(config.systemPrompt)
             appendLine()
-            appendLine("=== USER ===")
+            appendLine("== USER ==")
             appendLine(prompt)
         }
 
@@ -74,14 +103,19 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
         log("  dumped → ${file.path}")
     }
 
+    /** Strip control characters (except newline, tab, carriage return) that break JSON serialization. */
+    private fun sanitizeText(text: String): String =
+        text.replace(Regex("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]"), "")
+
     /** Use Kreuzberg to extract text from a file and wrap it as a [TextDocument]. */
     fun documentSource(path: String) = DocumentSource {
         log("Loading document: $path")
         val start = System.currentTimeMillis()
         val result = Kreuzberg.extractFile(path)
         val elapsed = System.currentTimeMillis() - start
-        log("Document loaded: ${result.content.length} chars in ${elapsed}ms")
-        TextDocument(result.content)
+        val sanitized = sanitizeText(result.content)
+        log("Document loaded: ${sanitized.length} chars in ${elapsed}ms")
+        TextDocument(sanitized)
     }
 
     /**
@@ -99,7 +133,7 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
         log("LOCATE level [${parts.joinToString { it.name }}] in ${text.length} chars…")
         val prompt = buildLevelLocatorPrompt(parts, descriptor, text)
         val response = chat("locate:$names", prompt)
-        val result = parseLevelLocatorResponse(response, parts)
+        val result = parseLevelLocatorResponse(response, parts, text)
         result.forEach { (part, located) ->
             log("LOCATE ${part.name}: found ${located.size} occurrence(s)")
         }
@@ -120,9 +154,39 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
         log("EXTRACT ${property.name} (${property.type}, ${property.multiplicity}) from ${text.length} chars…")
         val prompt = buildPropertyExtractorPrompt(property, descriptor, text)
         val response = chat("extract:${property.name}", prompt)
-        val results = parsePropertyExtractorResponse(response)
+        val results = parsePropertyExtractorResponse(response, text)
         log("EXTRACT ${property.name}: ${results.map { it.value }}")
         results
+    }
+
+    // ── One-shot extraction ────────────────────────────────────────────────────
+
+    /**
+     * Extracts structured data in a single LLM call by passing the full JSON schema
+     * and document text, returning the raw JSON response.
+     */
+    fun extractOneShot(descriptor: Descriptor, documentPath: String): String {
+        val doc = documentSource(documentPath).load() as TextDocument
+        val schema = descriptor.toJsonSchemaString()
+
+        val prompt = """
+            |You are extracting structured data from a document.
+            |Document type: ${descriptor.name} — ${descriptor.description}
+            |
+            |Extract all fields from the document text below and return a single JSON object
+            |conforming to this JSON Schema:
+            |$schema
+            |
+            |RULES:
+            |- Respond with ONLY the JSON object, no commentary, no markdown fences.
+            |- If a value is not found, use null.
+            |- For array fields, return an empty array [] if no values are found.
+            |
+            |DOCUMENT TEXT:
+            |${doc.text}
+        """.trimMargin()
+
+        return chat("one-shot", prompt)
     }
 
     // ── Prompt builders ─────────────────────────────────────────────────────────
@@ -134,9 +198,14 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
             "  - \"${part.name}\"$mult$hints"
         }
 
+        val schemaBlock = descriptor.toJsonSchemaString()
+
         return """
             |You are segmenting a document into its structural sections.
             |Document type: ${descriptor.name} — ${descriptor.description}
+            |
+            |The document conforms to this JSON Schema:
+            |$schemaBlock
             |
             |Task: Split the text below into these sections:
             |$sectionsDescription
@@ -163,11 +232,7 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
     }
 
     private fun buildPropertyExtractorPrompt(property: Property, descriptor: Descriptor, text: String): String {
-        val hintsSection = if (property.hints.isNotEmpty())
-            "\nHints: ${property.hints.joinToString(". ")}" else ""
-        val patternSection = if (property.pattern != null)
-            "\nExpected pattern: ${property.pattern}" else ""
-        val typeGuide = "Expected type: ${property.type.name}"
+        val schema = property.toJsonSchemaString()
         val multiplicityGuide = when {
             property.multiplicity.max == 1 -> "Extract exactly ONE value."
             else -> "There may be MULTIPLE values. Extract ALL of them."
@@ -178,8 +243,10 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
             |Document type: ${descriptor.name} — ${descriptor.description}
             |
             |Task: Extract the value of "${property.name}" from the text below.
-            |$typeGuide
-            |$multiplicityGuide$hintsSection$patternSection
+            |$multiplicityGuide
+            |
+            |The extracted value must conform to this JSON Schema:
+            |$schema
             |
             |RESPOND with each value on its own line. No labels, no commentary.
             |If the value is not found, respond with exactly: NONE
@@ -195,7 +262,8 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
 
     private fun parseLevelLocatorResponse(
         response: String,
-        parts: List<Part>
+        parts: List<Part>,
+        sourceText: String
     ): Map<Part, List<Located<Document>>> {
         val partsByName = parts.associateBy { it.name.lowercase() }
         val result = mutableMapOf<Part, MutableList<Located<Document>>>()
@@ -208,8 +276,9 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
             val part = currentPart ?: return
             val text = currentText.toString().trim()
             if (text.isNotBlank()) {
+                val location = TextLocation.find(text, sourceText)
                 result.getOrPut(part) { mutableListOf() }
-                    .add(Located(TextDocument(text) as Document, null))
+                    .add(Located(TextDocument(text) as Document, location))
             }
             currentText.clear()
         }
@@ -234,7 +303,7 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
         return result
     }
 
-    private fun parsePropertyExtractorResponse(response: String): List<Located<String>> {
+    private fun parsePropertyExtractorResponse(response: String, sourceText: String): List<Located<String>> {
         val trimmed = response.trim()
         if (trimmed.equals("NONE", ignoreCase = true) || trimmed.isBlank()) {
             return emptyList()
@@ -244,7 +313,7 @@ class Extractor(private val config: LlmConfig, private val dumpDir: File? = null
             .lines()
             .map { it.trim() }
             .filter { it.isNotBlank() }
-            .map { Located(it, null) }
+            .map { Located(it, TextLocation.find(it, sourceText)) }
     }
 }
 
@@ -266,7 +335,8 @@ private fun renderObject(
     partDefs: List<Part>,
     propRecords: List<PropertyRecord>,
     partInstances: List<PartInstances>,
-    indent: Int
+    indent: Int,
+    extraEntries: List<() -> Unit> = emptyList()
 ) {
     val pad = "  ".repeat(indent)
     val inner = "  ".repeat(indent + 1)
@@ -279,14 +349,20 @@ private fun renderObject(
             val isArray = record.property.multiplicity.max > 1
             if (isArray) {
                 sb.appendLine("$inner\"${record.property.name}\": [")
-                record.values.forEachIndexed { i, v ->
-                    val comma = if (i < record.values.size - 1) "," else ""
-                    sb.appendLine("$inner  ${jsonValue(v, record.property)}$comma")
+                record.locatedValues.forEachIndexed { i, lv ->
+                    val comma = if (i < record.locatedValues.size - 1) "," else ""
+                    sb.appendLine("$inner  ${jsonValue(lv.value, record.property)}$comma")
                 }
                 sb.append("$inner]")
             } else {
                 val value = record.values.firstOrNull()
                 sb.append("$inner\"${record.property.name}\": ${jsonValue(value, record.property)}")
+            }
+        }
+        val source = record.locatedValues.firstOrNull()?.location as? TextLocation
+        if (source != null) {
+            entries.add {
+                sb.append("$inner\"${record.property.name}_source\": ${jsonLocation(source)}")
             }
         }
     }
@@ -297,7 +373,7 @@ private fun renderObject(
             if (isArray) {
                 sb.appendLine("$inner\"${instances.part.name}\": [")
                 instances.occurrences.forEachIndexed { i, occ ->
-                    renderObject(sb, instances.part.properties, instances.part.parts, occ.properties, occ.parts, indent + 2)
+                    renderPartRecord(sb, instances.part, occ, indent + 2)
                     if (i < instances.occurrences.size - 1) sb.appendLine(",") else sb.appendLine()
                 }
                 sb.append("$inner]")
@@ -305,7 +381,7 @@ private fun renderObject(
                 sb.appendLine("$inner\"${instances.part.name}\":")
                 val occ = instances.occurrences.firstOrNull()
                 if (occ != null) {
-                    renderObject(sb, instances.part.properties, instances.part.parts, occ.properties, occ.parts, indent + 1)
+                    renderPartRecord(sb, instances.part, occ, indent + 1)
                 } else {
                     sb.append("${inner}null")
                 }
@@ -313,13 +389,29 @@ private fun renderObject(
         }
     }
 
-    entries.forEachIndexed { i, render ->
+    val allEntries = extraEntries + entries
+    allEntries.forEachIndexed { i, render ->
         render()
-        if (i < entries.size - 1) sb.appendLine(",") else sb.appendLine()
+        if (i < allEntries.size - 1) sb.appendLine(",") else sb.appendLine()
     }
 
     sb.append("$pad}")
 }
+
+private fun renderPartRecord(sb: StringBuilder, part: Part, occ: PartRecord, indent: Int) {
+    val inner = "  ".repeat(indent + 1)
+    val sourceEntries = mutableListOf<() -> Unit>()
+    val source = occ.location as? TextLocation
+    if (source != null) {
+        sourceEntries.add {
+            sb.append("$inner\"_source\": ${jsonLocation(source)}")
+        }
+    }
+    renderObject(sb, part.properties, part.parts, occ.properties, occ.parts, indent, sourceEntries)
+}
+
+private fun jsonLocation(loc: TextLocation): String =
+    """{"startChar": ${loc.startChar}, "endChar": ${loc.endChar}, "startLine": ${loc.startLine}, "endLine": ${loc.endLine}}"""
 
 private fun jsonValue(value: String?, property: Property): String {
     if (value == null) return "null"

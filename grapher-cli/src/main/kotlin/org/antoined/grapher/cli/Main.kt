@@ -30,14 +30,17 @@ private val LLM_FLAGS = setOf(
 fun main() {
     boot(
         arrayOf(
-            ".local/format/tapi.yaml",
-            ".local/input/JTAPI_001259_2024_A_4153_2024.pdf",
+            "--one-shot",
+            "local/format/tapi.yaml",
+            "local/input/JTAPI_001259_2024_A_4153_2024.pdf",
             "--llm-base-url",
             "http://heavy:8080/v1",
             "--llm-model",
-            "qwen3.5-9B",
+            "qwen3.5-9B-nothink",
             "--dump-dir",
-            "trace"
+            "trace",
+            "--llm-max-tokens",
+            "${1024 * 64}"
         )
     )
 }
@@ -78,13 +81,34 @@ fun boot(args: Array<String>) {
             println(record.toJson(descriptor))
         }
 
+        Command.ONE_SHOT -> {
+            val formatFile = requireFile(parsed.positional[0], "Format file")
+            val documentFile = requireFile(parsed.positional[1], "Document file")
+            val descriptor = loadDescriptor(formatFile)
+            val llmConfig = LlmConfig.resolve(parsed.flags)
+            val dumpDir = parsed.flags["dump-dir"]?.let { File(it) }
+            val extractor = Extractor(llmConfig, dumpDir)
+
+            log("Mode       : one-shot")
+            log("Descriptor : ${descriptor.namespace}/${descriptor.name} v${descriptor.version}")
+            log("Document   : ${documentFile.path}")
+            log("LLM        : ${llmConfig.baseUrl}  model=${llmConfig.model}  temp=${llmConfig.temperature}  maxTokens=${llmConfig.maxTokens}")
+
+            val start = System.currentTimeMillis()
+            val json = extractor.extractOneShot(descriptor, documentFile.path)
+            val elapsed = System.currentTimeMillis() - start
+
+            log("Done in ${elapsed}ms")
+            println(json)
+        }
+
         Command.HELP -> printUsage()
     }
 }
 
 // ── Arg parsing ─────────────────────────────────────────────────────────────
 
-private enum class Command { SCHEMA, EXTRACT, HELP }
+private enum class Command { SCHEMA, EXTRACT, ONE_SHOT, HELP }
 
 private data class ParsedArgs(
     val command: Command,
@@ -96,6 +120,7 @@ private fun parseArgs(args: Array<String>): ParsedArgs {
     val flags = mutableMapOf<String, String>()
     val positional = mutableListOf<String>()
     var schemaMode = false
+    var oneShotMode = false
 
     var i = 0
     while (i < args.size) {
@@ -104,6 +129,9 @@ private fun parseArgs(args: Array<String>): ParsedArgs {
             arg == "--help" || arg == "-h" -> return ParsedArgs(Command.HELP, emptyList(), emptyMap())
             arg == "--schema" -> {
                 schemaMode = true; i++
+            }
+            arg == "--one-shot" -> {
+                oneShotMode = true; i++
             }
 
             arg in LLM_FLAGS -> {
@@ -136,6 +164,14 @@ private fun parseArgs(args: Array<String>): ParsedArgs {
             ParsedArgs(Command.SCHEMA, positional, flags)
         }
 
+        oneShotMode -> {
+            if (positional.size != 2) {
+                System.err.println("--one-shot requires a format file and a document file")
+                exitProcess(1)
+            }
+            ParsedArgs(Command.ONE_SHOT, positional, flags)
+        }
+
         positional.size == 2 -> ParsedArgs(Command.EXTRACT, positional, flags)
         else -> ParsedArgs(Command.HELP, emptyList(), emptyMap())
     }
@@ -159,10 +195,12 @@ private fun printUsage() {
     System.err.println(
         """
         |Usage: grapher-cli [options] <format-file> <document-file>
+        |       grapher-cli --one-shot [options] <format-file> <document-file>
         |       grapher-cli --schema <format-file>
         |
         |Commands:
-        |  <format-file> <document-file>   Extract structured data from a document
+        |  <format-file> <document-file>   Extract structured data from a document (multi-pass FSM)
+        |  --one-shot <format> <document>   Extract in a single LLM call using JSON Schema
         |  --schema <format-file>           Print the JSON Schema for the given format
         |
         |LLM options:
